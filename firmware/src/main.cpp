@@ -21,6 +21,8 @@
 #define PTYPE_DISK 4
 #define PTYPE_UPTIME 5
 
+const char *softAPName = "ESP32_Config_AP";
+
 const uint16_t BROADCAST_PORT = 33333;
 const uint16_t TCP_PORT = 3333;
 
@@ -442,8 +444,21 @@ void updateScreen()
 
 void drawInfo()
 {
-  //if we are an AP, show the details and how to
-  //if we are connected to wifi, show IP and port
+  if (WiFi.getMode() == WIFI_AP) 
+  {
+    //if we are an AP, show the details and how to
+    tft.drawString("Access Point Mode", 0, 0);
+    tft.drawString(softAPName, 0, 25);
+    tft.drawString(WiFi.softAPIP().toString().c_str(), 0, 50);
+  }
+  else
+  {
+    //if we are connected to wifi, show IP and port
+    tft.drawString("Connected Mode", 0, 0);
+    tft.drawString("Waiting for data...", 0, 25);
+    tft.drawString(prefSsid.c_str(), 0, 75);
+    tft.drawString(WiFi.localIP().toString().c_str(), 0, 100);
+  }
 }
 
 void drawStats()
@@ -622,8 +637,8 @@ void connectToWiFi() {
 
 void startAccessPoint() {
   WiFi.mode(WIFI_AP);
-  WiFi.softAP("ESP32_Config_AP");
-  Serial.println("AP started: ESP32_Config_AP");
+  WiFi.softAP(softAPName);
+  Serial.printf("AP started: %s\n", softAPName);
   Serial.print("IP: ");
   Serial.println(WiFi.softAPIP());
 
