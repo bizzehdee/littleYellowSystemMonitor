@@ -144,11 +144,6 @@ void setup()
     startAccessPoint();
   }
 
-  Serial.printf("\nConnected! IP address: %s\n", WiFi.localIP().toString().c_str());
-
-  server.begin();
-  Serial.println("TCP server started on port 3333");
-
   pinMode(BACKLIGHT_PIN, OUTPUT);
   digitalWrite(BACKLIGHT_PIN, HIGH); // Enable backlight
 
@@ -158,8 +153,6 @@ void setup()
   tft.setTextColor(TFT_WHITE);
 
   switchToState(0);
-
-  udp.begin(BROADCAST_PORT);
 }
 
 void loop()
@@ -617,7 +610,10 @@ void connectToWiFi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
-    
+
+    server.begin();
+    udp.begin(BROADCAST_PORT);
+    Serial.println("TCP server started on port 3333");
   } else {
     Serial.println("\nFailed to connect, starting AP instead...");
     startAccessPoint();
