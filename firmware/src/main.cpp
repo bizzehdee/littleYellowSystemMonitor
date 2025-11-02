@@ -5,6 +5,7 @@
 #include <SPI.h>
 #include <Preferences.h>
 #include <WebServer.h>
+#include "constants.h"
 
 #define GFXFF 1
 #define FS9 &FreeSans9pt7b
@@ -20,11 +21,6 @@
 #define PTYPE_RAM 3
 #define PTYPE_DISK 4
 #define PTYPE_UPTIME 5
-
-const char *softAPName = "ESP32_Config_AP";
-
-const uint16_t BROADCAST_PORT = 33333;
-const uint16_t TCP_PORT = 3333;
 
 Preferences prefs;
 
@@ -44,16 +40,6 @@ void readDataWifi();
 void drawInfo();
 void drawStats();
 
-const uint32_t screenWidth = 320;
-const uint32_t screenHeight = 240;
-
-const uint32_t barHeight = 20;
-const uint32_t fontHeight = 22;
-const uint32_t cpuBarHeight = 35;
-const uint32_t spacing = 5;
-
-const uint32_t targetRefreshRate = 10; // fps
-const uint32_t targetRefreshInterval = (1000 / targetRefreshRate);
 uint64_t lastRefreshTime = 0, lastRefreshTime1hz = 0, lastRefreshBroadcast = 0, lastPacketRecieved = 0;
 uint8_t screenState = -1;
 
@@ -75,8 +61,6 @@ uint32_t ramPercentage = 50;
 uint32_t ramPercentageOld = 0;
 char *ramUsageTextBuffer = new char[20];
 
-uint32_t cpuMaxTemp = 95;
-
 uint64_t diskIOReadKbps = 0;
 uint64_t diskIOReadKbpsOld = 1;
 uint64_t diskIOWriteKbps = 0;
@@ -97,7 +81,7 @@ char *uptimeTextBuffer = new char[12];
   3 = data length high byte (int16)
   4 = actual payload
 */
-uint8_t state = 0;
+uint8_t packetReadState = 0;
 /*
   0 = nop
   1 = cpu load (with cores)
@@ -111,7 +95,7 @@ uint8_t packetType = 0;
 uint16_t expectedPayloadLength = 0;
 uint16_t payloadIdx = 0;
 
-uint8_t *payload = new uint8_t[MAX_PAYLOAD_SIZE+1];
+uint8_t *payload = new uint8_t[MAX_PAYLOAD_SIZE + 1];
 
 String prefSsid, prefPassword;
 WebServer webServer(80);
@@ -136,13 +120,12 @@ void setup()
 
   memset(cpuLoads, 100, sizeof(uint8_t) * cpuCoreCount);
 
-  Serial.begin(115200);
-
-  if (prefSsid.length() > 0) {
-    Serial.println("Found stored WiFi credentials, connecting...");
+  if (prefSsid.length() > 0)
+  {
     connectToWiFi();
-  } else {
-    Serial.println("No WiFi credentials found, starting AP...");
+  }
+  else
+  {
     startAccessPoint();
   }
 
@@ -159,9 +142,12 @@ void setup()
 
 void loop()
 {
-  if (WiFi.getMode() == WIFI_AP) {
+  if (WiFi.getMode() == WIFI_AP)
+  {
     webServer.handleClient();
-  } else {
+  }
+  else
+  {
     readDataWifi();
   }
 
@@ -174,16 +160,16 @@ void loop()
     updateScreen();
   }
 
-  if(currentTime - lastRefreshTime1hz > 1000)
+  if (currentTime - lastRefreshTime1hz > 1000)
   {
 
     lastRefreshTime1hz = currentTime;
   }
 
-  if(currentTime - lastRefreshBroadcast > 5000)
+  if (currentTime - lastRefreshBroadcast > 5000)
   {
     lastRefreshBroadcast = currentTime;
-       
+
     snprintf(broadcastMessage, sizeof(broadcastMessage),
              "SYSMN_INFO %s %u",
              WiFi.localIP().toString().c_str(),
@@ -195,13 +181,12 @@ void loop()
     udp.endPacket();
   }
 
-  if(currentTime - lastPacketRecieved > 10000)
+  if (currentTime - lastPacketRecieved > 10000)
   {
     switchToState(0);
   }
-
 }
-  
+
 void readDataWifi()
 {
   uint8_t checksum = 0;
@@ -217,51 +202,51 @@ void readDataWifi()
   {
     uint8_t byte = client.read();
 
-    switch (state)
+    switch (packetReadState)
     {
     case 0:
       if (byte == 0xFA)
       {
         expectedPayloadLength = 0;
         packetType = 0;
-        state = 1;
+        packetReadState = 1;
         payloadIdx = 0;
         memset(payload, 0, MAX_PAYLOAD_SIZE + 1);
       }
       break;
     case 1:
       expectedPayloadLength = byte;
-      state = 2;
+      packetReadState = 2;
       break;
     case 2:
       expectedPayloadLength |= (byte << 8);
 
-      if(expectedPayloadLength > MAX_PAYLOAD_SIZE) 
+      if (expectedPayloadLength > MAX_PAYLOAD_SIZE)
       {
-        state = 0;
+        packetReadState = 0;
         break;
       }
 
-      state = 3;
+      packetReadState = 3;
       break;
     case 3:
       packetType = byte;
 
-      if(packetType >= 0 && packetType <= 5)
+      if (packetType >= 0 && packetType <= 5)
       {
-        state = 4;
+        packetReadState = 4;
       }
       else // invalid packet type
       {
-        state = 0;
+        packetReadState = 0;
       }
 
       break;
     case 4:
       payload[payloadIdx++] = byte;
-      if(payloadIdx >= MAX_PAYLOAD_SIZE) 
+      if (payloadIdx >= MAX_PAYLOAD_SIZE)
       {
-        state = 0;
+        packetReadState = 0;
         break;
       }
 
@@ -279,7 +264,7 @@ void readDataWifi()
           switchToState(1);
         }
 
-        state = 0;
+        packetReadState = 0;
       }
 
       break;
@@ -319,8 +304,10 @@ void processPacket(uint8_t packet, uint16_t length, uint8_t *payload)
     {
       cpuCoreCount = max(min(payload[1], (uint8_t)100), (uint8_t)0);
 
-      if(cpuLoads != NULL) delete cpuLoads;
-      if(cpuLoadsOld != NULL) delete cpuLoadsOld;
+      if (cpuLoads != NULL)
+        delete cpuLoads;
+      if (cpuLoadsOld != NULL)
+        delete cpuLoadsOld;
 
       cpuLoads = new uint8_t[cpuCoreCount];
       cpuLoadsOld = new uint8_t[cpuCoreCount];
@@ -328,7 +315,7 @@ void processPacket(uint8_t packet, uint16_t length, uint8_t *payload)
 
     for (int i = 0; i < cpuCoreCount; i++)
     {
-      cpuLoads[i] = max(min(payload[2+i], (uint8_t)100), (uint8_t)0);
+      cpuLoads[i] = max(min(payload[2 + i], (uint8_t)100), (uint8_t)0);
     }
   }
   break;
@@ -340,11 +327,11 @@ void processPacket(uint8_t packet, uint16_t length, uint8_t *payload)
   case PTYPE_RAM: // ram
   {
 
-    maxRamInMb = *((uint16_t*)payload);
+    maxRamInMb = *((uint16_t *)payload);
     payload += 2;
-    
+
     usedRamInMb = *((uint16_t *)payload);
-    if(usedRamInMb > maxRamInMb)
+    if (usedRamInMb > maxRamInMb)
     {
       usedRamInMb = maxRamInMb;
     }
@@ -376,12 +363,10 @@ void processPacket(uint8_t packet, uint16_t length, uint8_t *payload)
 
 void switchToState(uint8_t newState)
 {
-  if(screenState == newState)
+  if (screenState == newState)
     return;
 
   screenState = newState;
-
-  Serial.printf("Switching state to %d\n", newState);
 
   tft.fillRect(0, 0, screenWidth, screenHeight, TFT_BLACK);
 
@@ -389,7 +374,7 @@ void switchToState(uint8_t newState)
   {
     tft.setFreeFont(MS9);
   }
-  else if(screenState == 1)
+  else if (screenState == 1)
   {
     tft.setFreeFont(FS9);
 
@@ -432,11 +417,11 @@ void drawGradientBar(TFT_eSPI *tft, int x, int y, int w, int h, int percent, cha
 
 void updateScreen()
 {
-  if(screenState == 0)
+  if (screenState == 0)
   {
     drawInfo();
   }
-  else if(screenState == 1)
+  else if (screenState == 1)
   {
     drawStats();
   }
@@ -444,16 +429,16 @@ void updateScreen()
 
 void drawInfo()
 {
-  if (WiFi.getMode() == WIFI_AP) 
+  if (WiFi.getMode() == WIFI_AP)
   {
-    //if we are an AP, show the details and how to
+    // if we are an AP, show the details and how to
     tft.drawString("Access Point Mode", 0, 0);
     tft.drawString(softAPName, 0, 25);
     tft.drawString(WiFi.softAPIP().toString().c_str(), 0, 50);
   }
   else
   {
-    //if we are connected to wifi, show IP and port
+    // if we are connected to wifi, show IP and port
     tft.drawString("Connected Mode", 0, 0);
     tft.drawString("Waiting for data...", 0, 25);
     tft.drawString(prefSsid.c_str(), 0, 75);
@@ -611,48 +596,46 @@ void drawStats()
   tft.end_nin_write();
 }
 
-void connectToWiFi() {
+void connectToWiFi()
+{
   WiFi.mode(WIFI_STA);
   WiFi.begin(prefSsid.c_str(), prefPassword.c_str());
 
-  Serial.printf("Connecting to %s", prefSsid.c_str());
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+  while (WiFi.status() != WL_CONNECTED && attempts < 20)
+  {
     delay(500);
-    Serial.print(".");
     attempts++;
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
-
+  if (WiFi.status() == WL_CONNECTED)
+  {
     server.begin();
     udp.begin(BROADCAST_PORT);
-    Serial.println("TCP server started on port 3333");
-  } else {
-    Serial.println("\nFailed to connect, starting AP instead...");
+  }
+  else
+  {
     startAccessPoint();
   }
 }
 
-void startAccessPoint() {
+void startAccessPoint()
+{
   WiFi.mode(WIFI_AP);
   WiFi.softAP(softAPName);
-  Serial.printf("AP started: %s\n", softAPName);
-  Serial.print("IP: ");
-  Serial.println(WiFi.softAPIP());
 
   startConfigServer();
 }
 
-void startConfigServer() {
+void startConfigServer()
+{
   webServer.on("/", handleRoot);
   webServer.on("/save", handleSave);
   webServer.begin();
-  Serial.println("HTTP server started for WiFi config");
 }
 
-void handleRoot() {
+void handleRoot()
+{
   String html = R"HTML(
   <html>
   <head><title>ESP32 WiFi Config</title></head>
@@ -669,11 +652,13 @@ void handleRoot() {
   webServer.send(200, "text/html", html);
 }
 
-void handleSave() {
+void handleSave()
+{
   String newSSID = webServer.arg("ssid");
   String newPASS = webServer.arg("pass");
 
-  if (newSSID.length() > 0) {
+  if (newSSID.length() > 0)
+  {
     prefs.begin("wifi", false);
     prefs.putString("ssid", newSSID);
     prefs.putString("pass", newPASS);
@@ -684,7 +669,9 @@ void handleSave() {
 
     delay(2000);
     ESP.restart();
-  } else {
+  }
+  else
+  {
     webServer.send(400, "text/plain", "SSID cannot be empty!");
   }
 }
