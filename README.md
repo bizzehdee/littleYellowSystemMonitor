@@ -34,7 +34,6 @@ Should be able to just load up the firmware directory in PlatformIO and build/in
 
 ## TODO
 
-* Implement the timeout/unconnected/wifi details screen
 * Support more platforms (rp2040? + other screens)
 * Support Linux OpenRC
 * Support Windows
