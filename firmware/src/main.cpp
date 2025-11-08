@@ -528,7 +528,7 @@ void drawStats()
 
     tft.drawString(diskIOReadTextBuffer, 0, yOffset, GFXFF);
 
-    diskIOReadKbps = diskIOReadKbpsOld;
+    diskIOReadKbpsOld = diskIOReadKbps;
   }
 
   if (diskIOWriteKbps != diskIOWriteKbpsOld)
