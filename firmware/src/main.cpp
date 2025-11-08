@@ -11,17 +11,6 @@
 #define FS9 &FreeSans9pt7b
 #define MS9 &FreeMono9pt7b
 
-#define MAX_PAYLOAD_SIZE 64
-
-#define BACKLIGHT_PIN 21
-
-#define PTYPE_NOP 0
-#define PTYPE_CPU 1
-#define PTYPE_TEMP 2
-#define PTYPE_RAM 3
-#define PTYPE_DISK 4
-#define PTYPE_UPTIME 5
-
 Preferences prefs;
 
 TFT_eSPI tft = TFT_eSPI();
@@ -34,8 +23,8 @@ char broadcastMessage[64];
 
 void switchToState(uint8_t newState);
 void updateScreen();
-uint8_t calcChecksum(uint8_t packet, uint16_t length, uint8_t *payload);
-void processPacket(uint8_t packet, uint16_t length, uint8_t *payload);
+uint8_t calcChecksum(PacketType packet, uint16_t length, uint8_t *payload);
+void processPacket(PacketType packet, uint16_t length, uint8_t *payload);
 void readDataWifi();
 void drawInfo();
 void drawStats();
@@ -48,31 +37,31 @@ uint8_t *cpuLoadsOld = new uint8_t[16];
 uint8_t *cpuLoads = new uint8_t[16];
 uint8_t cpuLoadOverall = 90;
 uint8_t cpuLoadOverallOld = 0;
-char *cpuLoadTextBuffer = new char[5];
+char cpuLoadTextBuffer[5];
 
 uint8_t cpuTempMax = 105;
 uint8_t cpuTempOverall = 79;
 uint8_t cpuTempOverallOld = 0;
-char *cpuTempTextBuffer = new char[5];
+char cpuTempTextBuffer[5];
 
 uint16_t maxRamInMb = 32 * 1024;
 uint16_t usedRamInMb = 16 * 1024;
 uint32_t ramPercentage = 50;
 uint32_t ramPercentageOld = 0;
-char *ramUsageTextBuffer = new char[20];
+char ramUsageTextBuffer[20];
 
 uint64_t diskIOReadKbps = 0;
 uint64_t diskIOReadKbpsOld = 1;
 uint64_t diskIOWriteKbps = 0;
 uint64_t diskIOWriteKbpsOld = 1;
-char *diskIOReadTextBuffer = new char[22];
-char *diskIOWriteTextBuffer = new char[22];
-char *diskIOReadSuffixText = new char[5];
-char *diskIOWriteSuffixText = new char[5];
+char diskIOReadTextBuffer[22];
+char diskIOWriteTextBuffer[22];
+char diskIOReadSuffixText[5];
+char diskIOWriteSuffixText[5];
 
 uint32_t uptimeCurrent = 0;
 uint32_t uptimeOld = 1;
-char *uptimeTextBuffer = new char[12];
+char uptimeTextBuffer[12];
 
 /*
   0 = waiting for start
@@ -91,7 +80,7 @@ uint8_t packetReadState = 0;
   5 = uptime
   6 = ...
 */
-uint8_t packetType = 0;
+PacketType packetType = PacketType::NOP;
 uint16_t expectedPayloadLength = 0;
 uint16_t payloadIdx = 0;
 
@@ -208,7 +197,7 @@ void readDataWifi()
       if (byte == 0xFA)
       {
         expectedPayloadLength = 0;
-        packetType = 0;
+        packetType = PacketType::NOP;
         packetReadState = 1;
         payloadIdx = 0;
         memset(payload, 0, MAX_PAYLOAD_SIZE + 1);
@@ -230,7 +219,7 @@ void readDataWifi()
       packetReadState = 3;
       break;
     case 3:
-      packetType = byte;
+      packetType = static_cast<PacketType>(byte);
 
       if (packetType >= 0 && packetType <= 5)
       {
@@ -259,7 +248,7 @@ void readDataWifi()
 
         if (chk == sentChk)
         {
-          processPacket(packetType, expectedPayloadLength, payload);
+          processPacket(static_cast<PacketType>(packetType), expectedPayloadLength, payload);
           lastPacketRecieved = millis();
           switchToState(1);
         }
@@ -272,12 +261,12 @@ void readDataWifi()
   }
 }
 
-uint8_t calcChecksum(uint8_t packet, uint16_t length, uint8_t *payload)
+uint8_t calcChecksum(PacketType pType, uint16_t length, uint8_t *payload)
 {
   uint8_t xChk = 0;
   xChk ^= (uint8_t)(length);
   xChk ^= (uint8_t)(length >> 8);
-  xChk ^= packet;
+  xChk ^= pType;
 
   for (uint16_t x = 0; x < length - 1; x++)
   {
@@ -287,15 +276,15 @@ uint8_t calcChecksum(uint8_t packet, uint16_t length, uint8_t *payload)
   return xChk;
 }
 
-void processPacket(uint8_t packet, uint16_t length, uint8_t *payload)
+void processPacket(PacketType pType, uint16_t length, uint8_t *payload)
 {
   // do nothing for now
-  switch (packet)
+  switch (pType)
   {
-  case PTYPE_NOP:
+  case NOP:
 
     break;
-  case PTYPE_CPU:
+  case CPU:
   {
     cpuLoadOverall = max(min(payload[0], (uint8_t)100), (uint8_t)0);
 
@@ -319,12 +308,12 @@ void processPacket(uint8_t packet, uint16_t length, uint8_t *payload)
     }
   }
   break;
-  case PTYPE_TEMP:
+  case TEMP:
   {
     cpuTempOverall = payload[0];
   }
   break;
-  case PTYPE_RAM: // ram
+  case RAM: // ram
   {
 
     maxRamInMb = *((uint16_t *)payload);
@@ -340,7 +329,7 @@ void processPacket(uint8_t packet, uint16_t length, uint8_t *payload)
     ramPercentage = (uint32_t)ramPercentageD;
   }
   break;
-  case PTYPE_DISK:
+  case DISK:
   {
     diskIOReadKbps = *((uint64_t *)payload);
     payload += 8;
@@ -353,7 +342,7 @@ void processPacket(uint8_t packet, uint16_t length, uint8_t *payload)
   }
 
   break;
-  case PTYPE_UPTIME:
+  case UPTIME:
   {
     uptimeCurrent = *((uint32_t *)payload);
   }
