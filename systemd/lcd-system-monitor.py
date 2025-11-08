@@ -16,7 +16,7 @@ class SystemMonitorService:
     PTYPE_DISK = 4
     PTYPE_UPTIME = 5
 
-    REFRESH_FPS = 10
+    REFRESH_FPS = 20
     BROADCAST_PORT = 33333
 
     def __init__(self):
