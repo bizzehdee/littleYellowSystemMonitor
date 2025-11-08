@@ -108,6 +108,7 @@ void setup()
   memset(diskIOWriteSuffixText, 0, 5);
 
   memset(cpuLoads, 100, sizeof(uint8_t) * cpuCoreCount);
+  memset(cpuLoadsOld, 0, sizeof(uint8_t) * cpuCoreCount);
 
   if (prefSsid.length() > 0)
   {
@@ -119,7 +120,7 @@ void setup()
   }
 
   pinMode(BACKLIGHT_PIN, OUTPUT);
-  digitalWrite(BACKLIGHT_PIN, HIGH); // Enable backlight
+  digitalWrite(BACKLIGHT_PIN, HIGH);
 
   tft.init();
   tft.setRotation(1);
@@ -183,7 +184,7 @@ void readDataWifi()
   if (!client || !client.connected())
   {
     delay(1);
-    client = server.available(); // Wait for connection
+    client = server.available();
   }
 
   // Handle incoming data
@@ -266,11 +267,14 @@ uint8_t calcChecksum(PacketType pType, uint16_t length, uint8_t *payload)
   uint8_t xChk = 0;
   xChk ^= (uint8_t)(length);
   xChk ^= (uint8_t)(length >> 8);
-  xChk ^= pType;
+  xChk ^= (uint8_t)pType;
 
-  for (uint16_t x = 0; x < length - 1; x++)
+  if (length > 0)
   {
-    xChk ^= payload[x];
+    for (uint16_t x = 0; x + 1 < length; x++)
+    {
+      xChk ^= payload[x];
+    }
   }
 
   return xChk;
@@ -278,48 +282,81 @@ uint8_t calcChecksum(PacketType pType, uint16_t length, uint8_t *payload)
 
 void processPacket(PacketType pType, uint16_t length, uint8_t *payload)
 {
-  // do nothing for now
+  uint8_t *p = payload;
+
   switch (pType)
   {
   case NOP:
-
     break;
+
   case CPU:
   {
-    cpuLoadOverall = max(min(payload[0], (uint8_t)100), (uint8_t)0);
+    if (length == 0)
+      return;
 
-    uint8_t newCoreCount = payload[1];
+    uint16_t dataLen = (length > 0) ? (length - 1) : 0; // excluding checksum
+    if (dataLen < 2)
+      return; // need at least overall + corecount
+
+    cpuLoadOverall = max(min(p[0], (uint8_t)100), (uint8_t)0);
+
+    uint8_t newCoreCount = p[1];
+    // clamp core count to sensible range [1,64]
+    newCoreCount = min(max(newCoreCount, (uint8_t)1), (uint8_t)64);
+
     if (newCoreCount != cpuCoreCount)
     {
-      cpuCoreCount = max(min(payload[1], (uint8_t)100), (uint8_t)0);
+      cpuCoreCount = newCoreCount;
 
       if (cpuLoads != NULL)
-        delete cpuLoads;
+      {
+        delete[] cpuLoads;
+        cpuLoads = nullptr;
+      }
       if (cpuLoadsOld != NULL)
-        delete cpuLoadsOld;
+      {
+        delete[] cpuLoadsOld;
+        cpuLoadsOld = nullptr;
+      }
 
       cpuLoads = new uint8_t[cpuCoreCount];
       cpuLoadsOld = new uint8_t[cpuCoreCount];
+      memset(cpuLoadsOld, 0, cpuCoreCount);
     }
+
+    if (dataLen < (uint16_t)(2 + cpuCoreCount))
+      return; // not enough data for cores
 
     for (int i = 0; i < cpuCoreCount; i++)
     {
-      cpuLoads[i] = max(min(payload[2 + i], (uint8_t)100), (uint8_t)0);
+      cpuLoads[i] = max(min(p[2 + i], (uint8_t)100), (uint8_t)0);
     }
   }
   break;
+
   case TEMP:
   {
+    if (length == 0)
+      return;
     cpuTempOverall = payload[0];
   }
   break;
-  case RAM: // ram
+
+  case RAM:
   {
+    if (length < 5)
+      return;
 
-    maxRamInMb = *((uint16_t *)payload);
-    payload += 2;
+    uint16_t dataLen = (length > 0) ? (length - 1) : 0;
+    if (dataLen < 4)
+      return;
 
-    usedRamInMb = *((uint16_t *)payload);
+    uint16_t maxRam = *((uint16_t *)p);
+    p += 2;
+    uint16_t usedRam = *((uint16_t *)p);
+
+    maxRamInMb = maxRam;
+    usedRamInMb = usedRam;
     if (usedRamInMb > maxRamInMb)
     {
       usedRamInMb = maxRamInMb;
@@ -329,21 +366,30 @@ void processPacket(PacketType pType, uint16_t length, uint8_t *payload)
     ramPercentage = (uint32_t)ramPercentageD;
   }
   break;
+
   case DISK:
   {
-    diskIOReadKbps = *((uint64_t *)payload);
-    payload += 8;
+    if (length < 17)
+      return;
 
-    diskIOReadKbps = diskIOReadKbps / 1024;
+    uint16_t dataLen = (length > 0) ? (length - 1) : 0;
+    if (dataLen < 16)
+      return;
 
-    diskIOWriteKbps = *((uint64_t *)payload);
+    uint64_t r = *((uint64_t *)p);
+    p += 8;
+    uint64_t w = *((uint64_t *)p);
 
-    diskIOWriteKbps = diskIOWriteKbps / 1024;
+    diskIOReadKbps = r / 1024;
+    diskIOWriteKbps = w / 1024;
   }
-
   break;
+
   case UPTIME:
   {
+    if (length < 5)
+      return;
+
     uptimeCurrent = *((uint32_t *)payload);
   }
   break;
@@ -444,7 +490,7 @@ void drawStats()
   // draw cpu load
   if (cpuLoadOverall != cpuLoadOverallOld)
   {
-    sprintf(cpuLoadTextBuffer, "%d%%", cpuLoadOverall);
+    snprintf(cpuLoadTextBuffer, sizeof(cpuLoadTextBuffer), "%d%%", cpuLoadOverall);
 
     drawGradientBar(&tft, 0, yOffset, screenWidth, barHeight, cpuLoadOverall, cpuLoadTextBuffer);
 
@@ -456,7 +502,7 @@ void drawStats()
   // draw cpu temp
   if (cpuTempOverall != cpuTempOverallOld)
   {
-    sprintf(cpuTempTextBuffer, "%dc", cpuTempOverall);
+    snprintf(cpuTempTextBuffer, sizeof(cpuTempTextBuffer), "%dc", cpuTempOverall);
 
     double tempPercentOfMax = ((double)cpuTempOverall / (double)cpuTempMax) * 100;
 
@@ -470,7 +516,7 @@ void drawStats()
   // draw ram usage
   if (ramPercentage != ramPercentageOld)
   {
-    sprintf(ramUsageTextBuffer, "%dmb / %dmb", usedRamInMb, maxRamInMb);
+    snprintf(ramUsageTextBuffer, sizeof(ramUsageTextBuffer), "%dmb / %dmb", usedRamInMb, maxRamInMb);
 
     drawGradientBar(&tft, 0, yOffset, screenWidth, barHeight, (int)ramPercentage, ramUsageTextBuffer);
 
@@ -479,7 +525,8 @@ void drawStats()
 
   yOffset += barHeight + spacing + fontHeight;
 
-  uint32_t coreWidth = (screenWidth / cpuCoreCount);
+  uint32_t coreCount = (cpuCoreCount == 0) ? 1 : cpuCoreCount;
+  uint32_t coreWidth = (screenWidth / coreCount);
 
   // draw core usage
   for (uint32_t i = 0; i < cpuCoreCount; i++)
@@ -508,23 +555,26 @@ void drawStats()
   if (diskIOReadKbps != diskIOReadKbpsOld)
   {
     double diskIOR = diskIOReadKbps; // show kbps
-    memccpy(diskIOReadSuffixText, "kb/s", 5, 5);
+    strncpy(diskIOReadSuffixText, "kb/s", sizeof(diskIOReadSuffixText));
+    diskIOReadSuffixText[sizeof(diskIOReadSuffixText) - 1] = '\0';
 
     if (diskIOReadKbps > 10240)
     {
       diskIOR = (double)diskIOReadKbps / 1024.0; // show mbps above 10mb
-      memccpy(diskIOReadSuffixText, "mb/s", 5, 5);
+      strncpy(diskIOReadSuffixText, "mb/s", sizeof(diskIOReadSuffixText));
+      diskIOReadSuffixText[sizeof(diskIOReadSuffixText) - 1] = '\0';
     }
     if (diskIOReadKbps > 1024000)
     {
       diskIOR = (double)diskIOReadKbps / 1024.0 / 1024.0; // show gbps above 10gb
-      memccpy(diskIOReadSuffixText, "gb/s", 5, 5);
+      strncpy(diskIOReadSuffixText, "gb/s", sizeof(diskIOReadSuffixText));
+      diskIOReadSuffixText[sizeof(diskIOReadSuffixText) - 1] = '\0';
     }
 
     uint32_t w = tft.textWidth(diskIOReadTextBuffer);
     tft.fillRect(0, yOffset, w, 15, TFT_BLACK); // clear previous
 
-    sprintf(diskIOReadTextBuffer, "Disk R: %0.1f%s", diskIOR, diskIOReadSuffixText);
+    snprintf(diskIOReadTextBuffer, sizeof(diskIOReadTextBuffer), "Disk R: %0.1f%s", diskIOR, diskIOReadSuffixText);
 
     tft.drawString(diskIOReadTextBuffer, 0, yOffset, GFXFF);
 
@@ -534,23 +584,26 @@ void drawStats()
   if (diskIOWriteKbps != diskIOWriteKbpsOld)
   {
     double diskIOW = diskIOWriteKbps; // show kbps
-    memccpy(diskIOWriteSuffixText, "kb/s", 5, 5);
+    strncpy(diskIOWriteSuffixText, "kb/s", sizeof(diskIOWriteSuffixText));
+    diskIOWriteSuffixText[sizeof(diskIOWriteSuffixText) - 1] = '\0';
     if (diskIOWriteKbps > 10240)
     {
       diskIOW = (double)diskIOWriteKbps / 1024.0; // show mbps above 10mb
-      memccpy(diskIOWriteSuffixText, "mb/s", 5, 5);
+      strncpy(diskIOWriteSuffixText, "mb/s", sizeof(diskIOWriteSuffixText));
+      diskIOWriteSuffixText[sizeof(diskIOWriteSuffixText) - 1] = '\0';
     }
     if (diskIOWriteKbps > 1024000)
     {
       diskIOW = (double)diskIOWriteKbps / 1024.0 / 1024.0; // show gbps above 10gb
-      memccpy(diskIOWriteSuffixText, "gb/s", 5, 5);
+      strncpy(diskIOWriteSuffixText, "gb/s", sizeof(diskIOWriteSuffixText));
+      diskIOWriteSuffixText[sizeof(diskIOWriteSuffixText) - 1] = '\0';
     }
 
     uint32_t w = tft.textWidth(diskIOWriteTextBuffer);
 
     tft.fillRect(0, yOffset + 15 + spacing, w, 15, TFT_BLACK); // clear previous
 
-    sprintf(diskIOWriteTextBuffer, "Disk W: %0.1f%s", diskIOW, diskIOWriteSuffixText);
+    snprintf(diskIOWriteTextBuffer, sizeof(diskIOWriteTextBuffer), "Disk W: %0.1f%s", diskIOW, diskIOWriteSuffixText);
 
     tft.drawString(diskIOWriteTextBuffer, 0, yOffset + 15 + spacing, GFXFF);
 
@@ -570,7 +623,7 @@ void drawStats()
     total_seconds %= 3600;
     uint32_t minutes = total_seconds / 60;
 
-    sprintf(uptimeTextBuffer, "%dd%02dh%02dm", days, hours, minutes);
+    snprintf(uptimeTextBuffer, sizeof(uptimeTextBuffer), "%dd%02dh%02dm", days, hours, minutes);
 
     uint32_t w = tft.textWidth(uptimeTextBuffer);
     uint32_t startX = screenWidth - w;
