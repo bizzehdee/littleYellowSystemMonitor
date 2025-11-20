@@ -5,6 +5,7 @@
 #include <SPI.h>
 #include <Preferences.h>
 #include <WebServer.h>
+#include <cstring>
 #include "constants.h"
 
 #define GFXFF 1
@@ -30,7 +31,7 @@ void drawInfo();
 void drawStats();
 
 uint64_t lastRefreshTime = 0, lastRefreshTime1hz = 0, lastRefreshBroadcast = 0, lastPacketRecieved = 0;
-uint8_t screenState = -1;
+uint8_t screenState = 1;
 
 uint8_t cpuCoreCount = 16;
 uint8_t *cpuLoadsOld = new uint8_t[16];
@@ -54,14 +55,14 @@ uint64_t diskIOReadKbps = 0;
 uint64_t diskIOReadKbpsOld = 1;
 uint64_t diskIOWriteKbps = 0;
 uint64_t diskIOWriteKbpsOld = 1;
-char diskIOReadTextBuffer[22];
-char diskIOWriteTextBuffer[22];
+char diskIOReadTextBuffer[32];
+char diskIOWriteTextBuffer[32];
 char diskIOReadSuffixText[5];
 char diskIOWriteSuffixText[5];
 
 uint32_t uptimeCurrent = 0;
 uint32_t uptimeOld = 1;
-char uptimeTextBuffer[12];
+char uptimeTextBuffer[20];
 
 /*
   0 = waiting for start
@@ -84,6 +85,8 @@ PacketType packetType = PacketType::NOP;
 uint16_t expectedPayloadLength = 0;
 uint16_t payloadIdx = 0;
 
+// payload buffer: allow indices 0..MAX_PAYLOAD_SIZE (last byte is checksum)
+// Allocate +1 so a full-size payload (MAX_PAYLOAD_SIZE) can be stored including checksum
 uint8_t *payload = new uint8_t[MAX_PAYLOAD_SIZE + 1];
 
 String prefSsid, prefPassword;
@@ -102,8 +105,8 @@ void setup()
   prefPassword = prefs.getString("pass");
   prefs.end();
 
-  memset(diskIOReadTextBuffer, 0, 22);
-  memset(diskIOWriteTextBuffer, 0, 22);
+  memset(diskIOReadTextBuffer, 0, sizeof(diskIOReadTextBuffer));
+  memset(diskIOWriteTextBuffer, 0, sizeof(diskIOWriteTextBuffer));
   memset(diskIOReadSuffixText, 0, 5);
   memset(diskIOWriteSuffixText, 0, 5);
 
@@ -165,9 +168,11 @@ void loop()
              WiFi.localIP().toString().c_str(),
              TCP_PORT);
 
-    IPAddress broadcastIP = ~WiFi.subnetMask() | WiFi.gatewayIP();
+    // compute broadcast from local IP and subnet mask
+    IPAddress broadcastIP = (WiFi.localIP() & WiFi.subnetMask()) | ~WiFi.subnetMask();
     udp.beginPacket(broadcastIP, BROADCAST_PORT);
-    udp.write((uint8_t *)broadcastMessage, sizeof(broadcastMessage));
+    // send only the used portion of the buffer
+    udp.write((const uint8_t *)broadcastMessage, strlen(broadcastMessage));
     udp.endPacket();
   }
 
@@ -179,7 +184,11 @@ void loop()
 
 void readDataWifi()
 {
-  uint8_t checksum = 0;
+  if (client && !client.connected())
+  {
+    // clean up a previous disconnected client
+    client.stop();
+  }
 
   if (!client || !client.connected())
   {
@@ -217,6 +226,12 @@ void readDataWifi()
         break;
       }
 
+      if(expectedPayloadLength == 0)
+      {
+        packetReadState = 0;
+        break;
+      }
+
       packetReadState = 3;
       break;
     case 3:
@@ -234,9 +249,11 @@ void readDataWifi()
       break;
     case 4:
       payload[payloadIdx++] = byte;
-      if (payloadIdx >= MAX_PAYLOAD_SIZE)
+      if (payloadIdx > MAX_PAYLOAD_SIZE)
       {
+        // overflow: reset parser state and drop the current data
         packetReadState = 0;
+        payloadIdx = 0;
         break;
       }
 
@@ -271,6 +288,7 @@ uint8_t calcChecksum(PacketType pType, uint16_t length, uint8_t *payload)
 
   if (length > 0)
   {
+    //XOR all payload bytes except the last byte (which is the checksum byte)
     for (uint16_t x = 0; x + 1 < length; x++)
     {
       xChk ^= payload[x];
@@ -293,16 +311,14 @@ void processPacket(PacketType pType, uint16_t length, uint8_t *payload)
   {
     if (length == 0)
       return;
-
     uint16_t dataLen = (length > 0) ? (length - 1) : 0; // excluding checksum
     if (dataLen < 2)
       return; // need at least overall + corecount
-
-    cpuLoadOverall = max(min(p[0], (uint8_t)100), (uint8_t)0);
+    cpuLoadOverall = CLAMP(p[0], 0, 100);
 
     uint8_t newCoreCount = p[1];
     // clamp core count to sensible range [1,64]
-    newCoreCount = min(max(newCoreCount, (uint8_t)1), (uint8_t)64);
+    newCoreCount = CLAMP(newCoreCount, 1, 64);
 
     if (newCoreCount != cpuCoreCount)
     {
@@ -329,15 +345,16 @@ void processPacket(PacketType pType, uint16_t length, uint8_t *payload)
 
     for (int i = 0; i < cpuCoreCount; i++)
     {
-      cpuLoads[i] = max(min(p[2 + i], (uint8_t)100), (uint8_t)0);
+      cpuLoads[i] = CLAMP(p[2 + i], 0, 100);
     }
   }
   break;
 
   case TEMP:
   {
-    if (length == 0)
+    if (length < 2)
       return;
+    
     cpuTempOverall = payload[0];
   }
   break;
@@ -351,9 +368,11 @@ void processPacket(PacketType pType, uint16_t length, uint8_t *payload)
     if (dataLen < 4)
       return;
 
-    uint16_t maxRam = *((uint16_t *)p);
-    p += 2;
-    uint16_t usedRam = *((uint16_t *)p);
+      uint16_t maxRam = 0;
+      memcpy(&maxRam, p, sizeof(maxRam));
+      p += 2;
+      uint16_t usedRam = 0;
+      memcpy(&usedRam, p, sizeof(usedRam));
 
     maxRamInMb = maxRam;
     usedRamInMb = usedRam;
@@ -376,9 +395,11 @@ void processPacket(PacketType pType, uint16_t length, uint8_t *payload)
     if (dataLen < 16)
       return;
 
-    uint64_t r = *((uint64_t *)p);
+    uint64_t r = 0;
+    memcpy(&r, p, sizeof(r));
     p += 8;
-    uint64_t w = *((uint64_t *)p);
+    uint64_t w = 0;
+    memcpy(&w, p, sizeof(w));
 
     diskIOReadKbps = r / 1024;
     diskIOWriteKbps = w / 1024;
@@ -390,7 +411,9 @@ void processPacket(PacketType pType, uint16_t length, uint8_t *payload)
     if (length < 5)
       return;
 
-    uptimeCurrent = *((uint32_t *)payload);
+    uint32_t up = 0;
+    memcpy(&up, payload, sizeof(up));
+    uptimeCurrent = up;
   }
   break;
   }
@@ -428,7 +451,7 @@ void drawGradientBar(TFT_eSPI *tft, int x, int y, int w, int h, int percent, cha
   uint16_t color1 = tft->color565(0, 255, 0);
   uint16_t color2 = tft->color565(255, 0, 0);
 
-  double barWidth = (percent / 100.0) * screenWidth;
+  double barWidth = CLAMP((CLAMP(percent,0,100) / 100.0) * w, 0, w);
   int barWidthInt = (int)barWidth;
 
   float delta = -255.0 / w;
@@ -446,7 +469,7 @@ void drawGradientBar(TFT_eSPI *tft, int x, int y, int w, int h, int percent, cha
 
   tft->fillRect(x, y, w - w2, h, TFT_BLACK);
 
-  uint32_t startX = (screenWidth / 2) - (tft->textWidth(text) / 2);
+  uint32_t startX = (w / 2) - (tft->textWidth(text) / 2);
   tft->drawString(text, startX, y + 2, GFXFF);
 }
 

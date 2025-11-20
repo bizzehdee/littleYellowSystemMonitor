@@ -21,6 +21,10 @@ const uint32_t spacing = 5;
 const uint32_t targetRefreshRate = 20; // fps
 const uint32_t targetRefreshInterval = (1000 / targetRefreshRate);
 
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define CLAMP(x, min, max) (MIN(MAX((x), (min)), (max)))
+
 enum PacketType : uint8_t
 {
     NOP = 0,
