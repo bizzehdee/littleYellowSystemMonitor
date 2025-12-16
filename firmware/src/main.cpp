@@ -6,6 +6,8 @@
 #include <Preferences.h>
 #include <WebServer.h>
 #include <cstring>
+#include <vector>
+#include <algorithm>
 #include "constants.h"
 
 #define GFXFF 1
@@ -22,20 +24,50 @@ WiFiUDP udp;
 
 char broadcastMessage[64];
 
-void switchToState(uint8_t newState);
+enum class ScreenState : uint8_t {
+    Info,
+    Stats
+};
+
+/*
+  Packet read states:
+  - WaitingForStart: expecting 0xFA
+  - ReadingLengthLow: reading low byte of payload length
+  - ReadingLengthHigh: reading high byte of payload length
+  - ReadingPacketType: reading the packet type
+  - ReadingPayload: reading payload bytes and checksum
+*/
+enum class PacketReadState : uint8_t {
+    WaitingForStart,
+    ReadingLengthLow,
+    ReadingLengthHigh,
+    ReadingPacketType,
+    ReadingPayload
+};
+
+
+void switchToState(ScreenState newState);
 void updateScreen();
 uint8_t calcChecksum(PacketType packet, uint16_t length, uint8_t *payload);
 void processPacket(PacketType packet, uint16_t length, uint8_t *payload);
 void readDataWifi();
 void drawInfo();
 void drawStats();
+void drawCpuLoad(uint32_t &yOffset);
+void drawCpuTemp(uint32_t &yOffset);
+void drawRamUsage(uint32_t &yOffset);
+void drawCoreUsage(uint32_t &yOffset);
+void drawDiskIO(uint32_t &yOffset);
+void drawUptime(uint32_t &yOffset);
+void formatSpeed(double &value, char* suffix, size_t suffixSize, uint64_t kbps);
 
-uint64_t lastRefreshTime = 0, lastRefreshTime1hz = 0, lastRefreshBroadcast = 0, lastPacketRecieved = 0;
-uint8_t screenState = 1;
+
+unsigned long lastRefreshTime = 0, lastRefreshTime1hz = 0, lastRefreshBroadcast = 0, lastPacketRecieved = 0;
+ScreenState screenState = ScreenState::Stats;
 
 uint8_t cpuCoreCount = 16;
-uint8_t *cpuLoadsOld = new uint8_t[16];
-uint8_t *cpuLoads = new uint8_t[16];
+std::vector<uint8_t> cpuLoadsOld(16, 0);
+std::vector<uint8_t> cpuLoads(16, 100);
 uint8_t cpuLoadOverall = 90;
 uint8_t cpuLoadOverallOld = 0;
 char cpuLoadTextBuffer[5];
@@ -71,7 +103,7 @@ char uptimeTextBuffer[20];
   3 = data length high byte (int16)
   4 = actual payload
 */
-uint8_t packetReadState = 0;
+PacketReadState packetReadState = PacketReadState::WaitingForStart;
 /*
   0 = nop
   1 = cpu load (with cores)
@@ -87,7 +119,7 @@ uint16_t payloadIdx = 0;
 
 // payload buffer: allow indices 0..MAX_PAYLOAD_SIZE (last byte is checksum)
 // Allocate +1 so a full-size payload (MAX_PAYLOAD_SIZE) can be stored including checksum
-uint8_t *payload = new uint8_t[MAX_PAYLOAD_SIZE + 1];
+std::vector<uint8_t> payload(MAX_PAYLOAD_SIZE + 1);
 
 String prefSsid, prefPassword;
 WebServer webServer(80);
@@ -110,9 +142,6 @@ void setup()
   memset(diskIOReadSuffixText, 0, 5);
   memset(diskIOWriteSuffixText, 0, 5);
 
-  memset(cpuLoads, 100, sizeof(uint8_t) * cpuCoreCount);
-  memset(cpuLoadsOld, 0, sizeof(uint8_t) * cpuCoreCount);
-
   if (prefSsid.length() > 0)
   {
     connectToWiFi();
@@ -130,7 +159,7 @@ void setup()
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_WHITE);
 
-  switchToState(0);
+  switchToState(ScreenState::Info);
 }
 
 void loop()
@@ -178,7 +207,7 @@ void loop()
 
   if (currentTime - lastPacketRecieved > 10000)
   {
-    switchToState(0);
+    switchToState(ScreenState::Info);
   }
 }
 
@@ -203,56 +232,56 @@ void readDataWifi()
 
     switch (packetReadState)
     {
-    case 0:
+    case PacketReadState::WaitingForStart:
       if (byte == 0xFA)
       {
         expectedPayloadLength = 0;
         packetType = PacketType::NOP;
-        packetReadState = 1;
+        packetReadState = PacketReadState::ReadingLengthLow;
         payloadIdx = 0;
-        memset(payload, 0, MAX_PAYLOAD_SIZE + 1);
+        std::fill(payload.begin(), payload.end(), 0);
       }
       break;
-    case 1:
+    case PacketReadState::ReadingLengthLow:
       expectedPayloadLength = byte;
-      packetReadState = 2;
+      packetReadState = PacketReadState::ReadingLengthHigh;
       break;
-    case 2:
+    case PacketReadState::ReadingLengthHigh:
       expectedPayloadLength |= (byte << 8);
 
       if (expectedPayloadLength > MAX_PAYLOAD_SIZE)
       {
-        packetReadState = 0;
+        packetReadState = PacketReadState::WaitingForStart;
         break;
       }
 
       if(expectedPayloadLength == 0)
       {
-        packetReadState = 0;
+        packetReadState = PacketReadState::WaitingForStart;
         break;
       }
 
-      packetReadState = 3;
+      packetReadState = PacketReadState::ReadingPacketType;
       break;
-    case 3:
+    case PacketReadState::ReadingPacketType:
       packetType = static_cast<PacketType>(byte);
 
       if (packetType >= 0 && packetType <= 5)
       {
-        packetReadState = 4;
+        packetReadState = PacketReadState::ReadingPayload;
       }
       else // invalid packet type
       {
-        packetReadState = 0;
+        packetReadState = PacketReadState::WaitingForStart;
       }
 
       break;
-    case 4:
+    case PacketReadState::ReadingPayload:
       payload[payloadIdx++] = byte;
       if (payloadIdx > MAX_PAYLOAD_SIZE)
       {
         // overflow: reset parser state and drop the current data
-        packetReadState = 0;
+        packetReadState = PacketReadState::WaitingForStart;
         payloadIdx = 0;
         break;
       }
@@ -261,17 +290,17 @@ void readDataWifi()
       if (payloadIdx == expectedPayloadLength)
       {
         // we have the whole payload, check the checksum, and process the data, and then start waiting for new data
-        uint8_t chk = calcChecksum(packetType, expectedPayloadLength, payload);
+        uint8_t chk = calcChecksum(packetType, expectedPayloadLength, payload.data());
         uint8_t sentChk = payload[payloadIdx - 1];
 
         if (chk == sentChk)
         {
-          processPacket(static_cast<PacketType>(packetType), expectedPayloadLength, payload);
+          processPacket(static_cast<PacketType>(packetType), expectedPayloadLength, payload.data());
           lastPacketRecieved = millis();
-          switchToState(1);
+          switchToState(ScreenState::Stats);
         }
 
-        packetReadState = 0;
+        packetReadState = PacketReadState::WaitingForStart;
       }
 
       break;
@@ -324,20 +353,8 @@ void processPacket(PacketType pType, uint16_t length, uint8_t *payload)
     {
       cpuCoreCount = newCoreCount;
 
-      if (cpuLoads != NULL)
-      {
-        delete[] cpuLoads;
-        cpuLoads = nullptr;
-      }
-      if (cpuLoadsOld != NULL)
-      {
-        delete[] cpuLoadsOld;
-        cpuLoadsOld = nullptr;
-      }
-
-      cpuLoads = new uint8_t[cpuCoreCount];
-      cpuLoadsOld = new uint8_t[cpuCoreCount];
-      memset(cpuLoadsOld, 0, cpuCoreCount);
+      cpuLoads.resize(cpuCoreCount);
+      cpuLoadsOld.assign(cpuCoreCount, 0);
     }
 
     if (dataLen < (uint16_t)(2 + cpuCoreCount))
@@ -381,7 +398,10 @@ void processPacket(PacketType pType, uint16_t length, uint8_t *payload)
       usedRamInMb = maxRamInMb;
     }
 
-    double ramPercentageD = ((double)usedRamInMb / (double)maxRamInMb) * 100;
+    double ramPercentageD = 0.0;
+    if (maxRamInMb > 0) {
+      ramPercentageD = ((double)usedRamInMb / (double)maxRamInMb) * 100;
+    }
     ramPercentage = (uint32_t)ramPercentageD;
   }
   break;
@@ -419,7 +439,7 @@ void processPacket(PacketType pType, uint16_t length, uint8_t *payload)
   }
 }
 
-void switchToState(uint8_t newState)
+void switchToState(ScreenState newState)
 {
   if (screenState == newState)
     return;
@@ -428,11 +448,11 @@ void switchToState(uint8_t newState)
 
   tft.fillRect(0, 0, screenWidth, screenHeight, TFT_BLACK);
 
-  if (screenState == 0)
+  if (screenState == ScreenState::Info)
   {
     tft.setFreeFont(MS9);
   }
-  else if (screenState == 1)
+  else if (screenState == ScreenState::Stats)
   {
     tft.setFreeFont(FS9);
 
@@ -475,11 +495,11 @@ void drawGradientBar(TFT_eSPI *tft, int x, int y, int w, int h, int percent, cha
 
 void updateScreen()
 {
-  if (screenState == 0)
+  if (screenState == ScreenState::Info)
   {
     drawInfo();
   }
-  else if (screenState == 1)
+  else if (screenState == ScreenState::Stats)
   {
     drawStats();
   }
@@ -510,136 +530,107 @@ void drawStats()
 
   tft.begin_nin_write();
 
-  // draw cpu load
-  if (cpuLoadOverall != cpuLoadOverallOld)
-  {
+  drawCpuLoad(yOffset);
+  drawCpuTemp(yOffset);
+  drawRamUsage(yOffset);
+  drawCoreUsage(yOffset);
+  drawDiskIO(yOffset);
+  drawUptime(yOffset);
+
+  tft.end_nin_write();
+}
+
+void formatSpeed(double &value, char* suffix, size_t suffixSize, uint64_t kbps) {
+    if (kbps > 1024000) {
+        value = (double)kbps / 1024.0 / 1024.0;
+        strncpy(suffix, "gb/s", suffixSize);
+    } else if (kbps > 10240) {
+        value = (double)kbps / 1024.0;
+        strncpy(suffix, "mb/s", suffixSize);
+    } else {
+        value = (double)kbps;
+        strncpy(suffix, "kb/s", suffixSize);
+    }
+    suffix[suffixSize - 1] = '\0';
+}
+
+void drawCpuLoad(uint32_t &yOffset) {
+  if (cpuLoadOverall != cpuLoadOverallOld) {
     snprintf(cpuLoadTextBuffer, sizeof(cpuLoadTextBuffer), "%d%%", cpuLoadOverall);
-
     drawGradientBar(&tft, 0, yOffset, screenWidth, barHeight, cpuLoadOverall, cpuLoadTextBuffer);
-
     cpuLoadOverallOld = cpuLoadOverall;
   }
-
   yOffset += barHeight + spacing + fontHeight;
+}
 
-  // draw cpu temp
-  if (cpuTempOverall != cpuTempOverallOld)
-  {
+void drawCpuTemp(uint32_t &yOffset) {
+  if (cpuTempOverall != cpuTempOverallOld) {
     snprintf(cpuTempTextBuffer, sizeof(cpuTempTextBuffer), "%dc", cpuTempOverall);
-
     double tempPercentOfMax = ((double)cpuTempOverall / (double)cpuTempMax) * 100;
-
     drawGradientBar(&tft, 0, yOffset, screenWidth, barHeight, (int)tempPercentOfMax, cpuTempTextBuffer);
-
     cpuTempOverallOld = cpuTempOverall;
   }
-
   yOffset += barHeight + spacing + fontHeight;
+}
 
-  // draw ram usage
-  if (ramPercentage != ramPercentageOld)
-  {
+void drawRamUsage(uint32_t &yOffset) {
+  if (ramPercentage != ramPercentageOld) {
     snprintf(ramUsageTextBuffer, sizeof(ramUsageTextBuffer), "%dmb / %dmb", usedRamInMb, maxRamInMb);
-
     drawGradientBar(&tft, 0, yOffset, screenWidth, barHeight, (int)ramPercentage, ramUsageTextBuffer);
-
     ramPercentageOld = ramPercentage;
   }
-
   yOffset += barHeight + spacing + fontHeight;
+}
 
+void drawCoreUsage(uint32_t &yOffset) {
   uint32_t coreCount = (cpuCoreCount == 0) ? 1 : cpuCoreCount;
   uint32_t coreWidth = (screenWidth / coreCount);
 
-  // draw core usage
-  for (uint32_t i = 0; i < cpuCoreCount; i++)
-  {
-    if (cpuLoadsOld[i] == cpuLoads[i])
-    {
+  for (uint32_t i = 0; i < cpuCoreCount; i++) {
+    if (cpuLoadsOld[i] == cpuLoads[i]) {
       continue;
     }
-    // find the x value
     uint32_t x = i * coreWidth;
-
     double thisCoreBarHeightD = cpuBarHeight / 100.0 * (double)cpuLoads[i];
-
     uint32_t barYOffset = (cpuBarHeight - (uint32_t)thisCoreBarHeightD);
     uint32_t barYStart = yOffset + barYOffset;
-
     tft.fillRect(x, yOffset, coreWidth - 1, barYOffset, TFT_BLACK); // clear previous
     tft.fillRect(x, barYStart, coreWidth - 1, (uint32_t)thisCoreBarHeightD, tft.color565(0, 0, 255));
-
     cpuLoadsOld[i] = cpuLoads[i];
   }
-
   yOffset += cpuBarHeight + spacing;
+}
 
-  // draw diskio usage
-  if (diskIOReadKbps != diskIOReadKbpsOld)
-  {
-    double diskIOR = diskIOReadKbps; // show kbps
-    strncpy(diskIOReadSuffixText, "kb/s", sizeof(diskIOReadSuffixText));
-    diskIOReadSuffixText[sizeof(diskIOReadSuffixText) - 1] = '\0';
-
-    if (diskIOReadKbps > 10240)
-    {
-      diskIOR = (double)diskIOReadKbps / 1024.0; // show mbps above 10mb
-      strncpy(diskIOReadSuffixText, "mb/s", sizeof(diskIOReadSuffixText));
-      diskIOReadSuffixText[sizeof(diskIOReadSuffixText) - 1] = '\0';
-    }
-    if (diskIOReadKbps > 1024000)
-    {
-      diskIOR = (double)diskIOReadKbps / 1024.0 / 1024.0; // show gbps above 10gb
-      strncpy(diskIOReadSuffixText, "gb/s", sizeof(diskIOReadSuffixText));
-      diskIOReadSuffixText[sizeof(diskIOReadSuffixText) - 1] = '\0';
-    }
+void drawDiskIO(uint32_t &yOffset) {
+  if (diskIOReadKbps != diskIOReadKbpsOld) {
+    double diskIOR = 0;
+    formatSpeed(diskIOR, diskIOReadSuffixText, sizeof(diskIOReadSuffixText), diskIOReadKbps);
 
     uint32_t w = tft.textWidth(diskIOReadTextBuffer);
     tft.fillRect(0, yOffset, w, 15, TFT_BLACK); // clear previous
 
     snprintf(diskIOReadTextBuffer, sizeof(diskIOReadTextBuffer), "Disk R: %0.1f%s", diskIOR, diskIOReadSuffixText);
-
     tft.drawString(diskIOReadTextBuffer, 0, yOffset, GFXFF);
-
     diskIOReadKbpsOld = diskIOReadKbps;
   }
 
-  if (diskIOWriteKbps != diskIOWriteKbpsOld)
-  {
-    double diskIOW = diskIOWriteKbps; // show kbps
-    strncpy(diskIOWriteSuffixText, "kb/s", sizeof(diskIOWriteSuffixText));
-    diskIOWriteSuffixText[sizeof(diskIOWriteSuffixText) - 1] = '\0';
-    if (diskIOWriteKbps > 10240)
-    {
-      diskIOW = (double)diskIOWriteKbps / 1024.0; // show mbps above 10mb
-      strncpy(diskIOWriteSuffixText, "mb/s", sizeof(diskIOWriteSuffixText));
-      diskIOWriteSuffixText[sizeof(diskIOWriteSuffixText) - 1] = '\0';
-    }
-    if (diskIOWriteKbps > 1024000)
-    {
-      diskIOW = (double)diskIOWriteKbps / 1024.0 / 1024.0; // show gbps above 10gb
-      strncpy(diskIOWriteSuffixText, "gb/s", sizeof(diskIOWriteSuffixText));
-      diskIOWriteSuffixText[sizeof(diskIOWriteSuffixText) - 1] = '\0';
-    }
-
+  if (diskIOWriteKbps != diskIOWriteKbpsOld) {
+    double diskIOW = 0;
+    formatSpeed(diskIOW, diskIOWriteSuffixText, sizeof(diskIOWriteSuffixText), diskIOWriteKbps);
+    
     uint32_t w = tft.textWidth(diskIOWriteTextBuffer);
-
     tft.fillRect(0, yOffset + 15 + spacing, w, 15, TFT_BLACK); // clear previous
 
     snprintf(diskIOWriteTextBuffer, sizeof(diskIOWriteTextBuffer), "Disk W: %0.1f%s", diskIOW, diskIOWriteSuffixText);
-
     tft.drawString(diskIOWriteTextBuffer, 0, yOffset + 15 + spacing, GFXFF);
-
     diskIOWriteKbpsOld = diskIOWriteKbps;
   }
+}
 
-  // draw uptime
+void drawUptime(uint32_t &yOffset) {
   tft.drawString("Up Time", screenWidth - tft.textWidth("Up Time"), yOffset, GFXFF);
-
-  if (uptimeCurrent != uptimeOld)
-  {
+  if (uptimeCurrent != uptimeOld) {
     uint32_t total_seconds = uptimeCurrent;
-
     uint32_t days = total_seconds / 86400;
     total_seconds %= 86400;
     uint32_t hours = total_seconds / 3600;
@@ -651,14 +642,10 @@ void drawStats()
     uint32_t w = tft.textWidth(uptimeTextBuffer);
     uint32_t startX = screenWidth - w;
     uint32_t startY = yOffset + 15 + spacing;
-
     tft.fillRect(startX, startY, w, 15, TFT_BLACK); // clear the previous text
     tft.drawString(uptimeTextBuffer, startX, startY, GFXFF);
-
     uptimeOld = uptimeCurrent;
   }
-
-  tft.end_nin_write();
 }
 
 void connectToWiFi()
