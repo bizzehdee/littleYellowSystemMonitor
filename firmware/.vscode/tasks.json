@@ -1,0 +1,11 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build firmware",
+			"type": "shell",
+			"command": "platformio run",
+			"group": "build"
+		}
+	]
+}

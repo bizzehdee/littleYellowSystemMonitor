@@ -32,7 +32,8 @@ enum PacketType : uint8_t
     TEMP = 2,
     RAM = 3,
     DISK = 4,
-    UPTIME = 5
+    UPTIME = 5,
+    STATE = 6
 };
 
 #endif // __LYSM_CONSTANTS_H_

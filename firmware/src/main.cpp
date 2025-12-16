@@ -18,8 +18,6 @@ Preferences prefs;
 
 TFT_eSPI tft = TFT_eSPI();
 
-WiFiServer server(TCP_PORT);
-WiFiClient client;
 WiFiUDP udp;
 
 char broadcastMessage[64];
@@ -63,6 +61,7 @@ void formatSpeed(double &value, char* suffix, size_t suffixSize, uint64_t kbps);
 
 
 unsigned long lastRefreshTime = 0, lastRefreshTime1hz = 0, lastRefreshBroadcast = 0, lastPacketRecieved = 0;
+uint32_t lastSequence = 0;
 ScreenState screenState = ScreenState::Stats;
 
 uint8_t cpuCoreCount = 16;
@@ -213,99 +212,50 @@ void loop()
 
 void readDataWifi()
 {
-  if (client && !client.connected())
+  int packetSize = udp.parsePacket();
+  if (packetSize <= 0)
   {
-    // clean up a previous disconnected client
-    client.stop();
+    return;
   }
 
-  if (!client || !client.connected())
+  std::vector<uint8_t> buf;
+  buf.resize(packetSize);
+  int readLen = udp.read(buf.data(), packetSize);
+  if (readLen != packetSize)
   {
-    delay(1);
-    client = server.available();
+    return;
   }
 
-  // Handle incoming data
-  while (client.available())
+  if (packetSize < 4)
   {
-    uint8_t byte = client.read();
-
-    switch (packetReadState)
-    {
-    case PacketReadState::WaitingForStart:
-      if (byte == 0xFA)
-      {
-        expectedPayloadLength = 0;
-        packetType = PacketType::NOP;
-        packetReadState = PacketReadState::ReadingLengthLow;
-        payloadIdx = 0;
-        std::fill(payload.begin(), payload.end(), 0);
-      }
-      break;
-    case PacketReadState::ReadingLengthLow:
-      expectedPayloadLength = byte;
-      packetReadState = PacketReadState::ReadingLengthHigh;
-      break;
-    case PacketReadState::ReadingLengthHigh:
-      expectedPayloadLength |= (byte << 8);
-
-      if (expectedPayloadLength > MAX_PAYLOAD_SIZE)
-      {
-        packetReadState = PacketReadState::WaitingForStart;
-        break;
-      }
-
-      if(expectedPayloadLength == 0)
-      {
-        packetReadState = PacketReadState::WaitingForStart;
-        break;
-      }
-
-      packetReadState = PacketReadState::ReadingPacketType;
-      break;
-    case PacketReadState::ReadingPacketType:
-      packetType = static_cast<PacketType>(byte);
-
-      if (packetType >= 0 && packetType <= 5)
-      {
-        packetReadState = PacketReadState::ReadingPayload;
-      }
-      else // invalid packet type
-      {
-        packetReadState = PacketReadState::WaitingForStart;
-      }
-
-      break;
-    case PacketReadState::ReadingPayload:
-      payload[payloadIdx++] = byte;
-      if (payloadIdx > MAX_PAYLOAD_SIZE)
-      {
-        // overflow: reset parser state and drop the current data
-        packetReadState = PacketReadState::WaitingForStart;
-        payloadIdx = 0;
-        break;
-      }
-
-      // read an extra byte because we want the chk
-      if (payloadIdx == expectedPayloadLength)
-      {
-        // we have the whole payload, check the checksum, and process the data, and then start waiting for new data
-        uint8_t chk = calcChecksum(packetType, expectedPayloadLength, payload.data());
-        uint8_t sentChk = payload[payloadIdx - 1];
-
-        if (chk == sentChk)
-        {
-          processPacket(static_cast<PacketType>(packetType), expectedPayloadLength, payload.data());
-          lastPacketRecieved = millis();
-          switchToState(ScreenState::Stats);
-        }
-
-        packetReadState = PacketReadState::WaitingForStart;
-      }
-
-      break;
-    }
+    return;
   }
+  uint8_t header = buf[0];
+  if (header != 0xFA)
+  {
+    return;
+  }
+  uint16_t length = (uint16_t)buf[1] | ((uint16_t)buf[2] << 8);
+  PacketType pType = (PacketType)buf[3];
+  if (length == 0 || length > MAX_PAYLOAD_SIZE)
+  {
+    return;
+  }
+  if ((int)(4 + length) > packetSize)
+  {
+    return;
+  }
+  uint8_t *pl = buf.data() + 4;
+  uint8_t chkCalc = calcChecksum(pType, length, pl);
+  uint8_t chkSent = pl[length - 1];
+  if (chkCalc != chkSent)
+  {
+    return;
+  }
+
+  processPacket(pType, length, pl);
+  lastPacketRecieved = millis();
+  switchToState(ScreenState::Stats);
 }
 
 uint8_t calcChecksum(PacketType pType, uint16_t length, uint8_t *payload)
@@ -335,6 +285,76 @@ void processPacket(PacketType pType, uint16_t length, uint8_t *payload)
   {
   case NOP:
     break;
+
+  case STATE:
+  {
+    uint16_t dataLen = (length > 0) ? (length - 1) : 0;
+    if (dataLen < 4)
+      return;
+    uint32_t seq = 0;
+    memcpy(&seq, p, sizeof(seq));
+    p += 4;
+    if (seq <= lastSequence)
+    {
+      return;
+    }
+    lastSequence = seq;
+
+    if ((payload + dataLen) - p < 2)
+      return;
+    cpuLoadOverall = CLAMP(p[0], 0, 100);
+    uint8_t newCoreCount = CLAMP(p[1], 1, 64);
+    p += 2;
+
+    if ((payload + dataLen) - p < newCoreCount)
+      return;
+    if (newCoreCount != cpuCoreCount)
+    {
+      cpuCoreCount = newCoreCount;
+      cpuLoads.resize(cpuCoreCount);
+      cpuLoadsOld.assign(cpuCoreCount, 0);
+    }
+    for (uint8_t i = 0; i < cpuCoreCount; i++)
+    {
+      cpuLoads[i] = CLAMP(p[i], 0, 100);
+    }
+    p += cpuCoreCount;
+
+    if ((payload + dataLen) - p < 1)
+      return;
+    cpuTempOverall = *p;
+    p += 1;
+
+    if ((payload + dataLen) - p < 4)
+      return;
+    uint16_t maxRam = 0;
+    memcpy(&maxRam, p, sizeof(maxRam));
+    p += 2;
+    uint16_t usedRam = 0;
+    memcpy(&usedRam, p, sizeof(usedRam));
+    p += 2;
+    maxRamInMb = maxRam;
+    usedRamInMb = MIN(usedRam, maxRamInMb);
+    double ramPercentageD = (maxRamInMb > 0) ? ((double)usedRamInMb / (double)maxRamInMb) * 100.0 : 0.0;
+    ramPercentage = (uint32_t)ramPercentageD;
+
+    if ((payload + dataLen) - p < 16)
+      return;
+    uint64_t r = 0, w = 0;
+    memcpy(&r, p, sizeof(r));
+    p += 8;
+    memcpy(&w, p, sizeof(w));
+    p += 8;
+    diskIOReadKbps = r / 1024;
+    diskIOWriteKbps = w / 1024;
+
+    if ((payload + dataLen) - p < 4)
+      return;
+    uint32_t up = 0;
+    memcpy(&up, p, sizeof(up));
+    uptimeCurrent = up;
+  }
+  break;
 
   case CPU:
   {
@@ -662,8 +682,8 @@ void connectToWiFi()
 
   if (WiFi.status() == WL_CONNECTED)
   {
-    server.begin();
-    udp.begin(BROADCAST_PORT);
+    // Listen for UDP state frames on data port
+    udp.begin(TCP_PORT);
   }
   else
   {

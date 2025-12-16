@@ -20,7 +20,7 @@ class SystemMonitorService:
     BROADCAST_PORT = 33333
 
     def __init__(self):
-        self.sock_writer: asyncio.StreamWriter | None = None
+        self.udp_sock: socket.socket | None = None
         self.esp32_ip = None
         self.esp32_port = None
         self.running = False
@@ -29,6 +29,7 @@ class SystemMonitorService:
 
         self._disk_last_time = 0.0
         self._disk_last_value = {"read_bytes": 0, "write_bytes": 0}
+        self._seq = 0
 
     # --------------------------
     # Setup / Lifecycle
@@ -49,8 +50,12 @@ class SystemMonitorService:
     def stop(self, *_):
         self.logger.info("SystemMonitorService stopping...")
         self.running = False
-        if self.sock_writer:
-            self.sock_writer.close()
+        if self.udp_sock:
+            try:
+                self.udp_sock.close()
+            except Exception:
+                pass
+            self.udp_sock = None
 
     # --------------------------
     # Main Loop
@@ -62,7 +67,7 @@ class SystemMonitorService:
         while self.running:
             try:
                 await self.ensure_connected()
-                if not self.sock_writer:
+                if not self.udp_sock:
                     await asyncio.sleep(2)
                     continue
 
@@ -75,16 +80,10 @@ class SystemMonitorService:
                 uptime = int(time.time() - psutil.boot_time())
 
                 # Build and send all packets concurrently
-                packets = [
-                    self.build_packet(self.PTYPE_CPU, self.pack_cpu_load(cpu_load, per_core)),
-                    self.build_packet(self.PTYPE_TEMP, self.pack_cpu_temp(cpu_temp)),
-                    self.build_packet(self.PTYPE_RAM, self.pack_ram(ram)),
-                    self.build_packet(self.PTYPE_DISK, self.pack_disk(disk)),
-                    self.build_packet(self.PTYPE_UPTIME, self.pack_uptime(uptime)),
-                ]
-
-                for p in packets:
-                    await self.send_packet(p)
+                state_payload = self.pack_state(self._seq, cpu_load, per_core, cpu_temp, ram, disk, uptime)
+                packet = self.build_packet(self.STATE_PACKET_TYPE(), state_payload)
+                await self.send_packet(packet)
+                self._seq = (self._seq + 1) & 0xFFFFFFFF
 
                 await asyncio.sleep(refresh_interval)
 
@@ -109,33 +108,30 @@ class SystemMonitorService:
         chk = self.calc_checksum(struct.pack("<H", length) + bytes([packet_type]) + data)
         return header + data + bytes([chk])
 
+    def STATE_PACKET_TYPE(self) -> int:
+        # Keep in sync with firmware PacketType::STATE = 6
+        return 6
+
     # --------------------------
     # Data Packing
     # --------------------------
-    def pack_cpu_load(self, total, per_core):
-        buf = struct.pack("<BB", int(total), len(per_core))
+    def pack_state(self, seq, total, per_core, temp, ram, disk, uptime):
+        buf = struct.pack("<I", int(seq))
+        buf += struct.pack("<BB", int(total), len(per_core))
         buf += bytes(int(c) for c in per_core)
+        buf += struct.pack("<B", int(temp))
+        buf += struct.pack("<HH", ram["total"], ram["used"])
+        buf += struct.pack("<QQ", int(disk["read_bytes"]), int(disk["write_bytes"]))
+        buf += struct.pack("<I", int(uptime))
         return buf
-
-    def pack_cpu_temp(self, temp):
-        return struct.pack("<B", int(temp))
-
-    def pack_ram(self, ram):
-        return struct.pack("<HH", ram["total"], ram["used"])
-
-    def pack_disk(self, disk):
-        return struct.pack("<QQ", int(disk["read_bytes"]), int(disk["write_bytes"]))
-
-    def pack_uptime(self, uptime):
-        return struct.pack("<I", uptime)
 
     # --------------------------
     # System Info
     # --------------------------
     def get_usage_per_core(self):
         per_logical = psutil.cpu_percent(percpu=True)
-        physical = psutil.cpu_count(logical=False)
-        threads_per_core = len(per_logical) // physical
+        physical = psutil.cpu_count(logical=False) or len(per_logical)
+        threads_per_core = max(len(per_logical) // max(physical, 1), 1)
         return [
             sum(per_logical[i * threads_per_core:(i + 1) * threads_per_core]) / threads_per_core
             for i in range(physical)
@@ -160,14 +156,15 @@ class SystemMonitorService:
         counters = psutil.disk_io_counters()
         if self._disk_last_time == 0:
             self._disk_last_time = now
-            self._disk_last_value = {"read_bytes": counters.read_bytes, "write_bytes": counters.write_bytes}
+            if counters:
+                self._disk_last_value = {"read_bytes": counters.read_bytes, "write_bytes": counters.write_bytes}
             return {"read_bytes": 0, "write_bytes": 0}
 
         elapsed = now - self._disk_last_time
-        if elapsed >= 3.0:
+        if elapsed >= 3.0 and counters:
             self.previousDelta = {
-                "read_bytes": max((counters.read_bytes - self._disk_last_value["read_bytes"]) / elapsed, 0),
-                "write_bytes": max((counters.write_bytes - self._disk_last_value["write_bytes"]) / elapsed, 0),
+                "read_bytes": max((counters.read_bytes - self._disk_last_value.get("read_bytes", 0)) / elapsed, 0),
+                "write_bytes": max((counters.write_bytes - self._disk_last_value.get("write_bytes", 0)) / elapsed, 0),
             }
             self._disk_last_time = now
             self._disk_last_value = {"read_bytes": counters.read_bytes, "write_bytes": counters.write_bytes}
@@ -177,40 +174,45 @@ class SystemMonitorService:
     # Network Handling
     # --------------------------
     async def ensure_connected(self):
-        """Keep TCP connection alive, rediscover if lost."""
-        if self.sock_writer and not self.sock_writer.is_closing():
+        """Ensure UDP socket exists and ESP32 data port discovered."""
+        if self.udp_sock:
             return
 
-        self.sock_writer = None
         self.logger.info("Searching for ESP32...")
 
-        while self.running and not self.sock_writer:
-            self.esp32_ip, self.esp32_port = await self.listen_for_esp32(timeout=10)
+        while self.running and not self.udp_sock:
+            result = await self.listen_for_esp32(timeout=10)
+            self.esp32_ip, self.esp32_port = result if result else (None, None)
             if not self.esp32_ip:
                 self.logger.info("No ESP32 found, retrying...")
                 await asyncio.sleep(5)
                 continue
 
             try:
-                reader, writer = await asyncio.open_connection(self.esp32_ip, self.esp32_port)
-                writer.transport.set_write_buffer_limits(0)
-                self.sock_writer = writer
-                self.logger.info(f"Connected to ESP32 at {self.esp32_ip}:{self.esp32_port}")
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setblocking(False)
+                self.udp_sock = s
+                self.logger.info(f"UDP ready for {self.esp32_ip}:{self.esp32_port}")
             except Exception as e:
-                self.logger.warning(f"Failed to connect to ESP32: {e}")
+                self.logger.warning(f"Failed to prepare UDP socket: {e}")
                 await asyncio.sleep(5)
 
     async def send_packet(self, data: bytes):
-        if not self.sock_writer:
+        if not self.udp_sock:
             return
         try:
-            self.sock_writer.write(data)
-            await self.sock_writer.drain()
+            # fire-and-forget UDP send
+            if not self.esp32_ip or not self.esp32_port:
+                return
+            self.udp_sock.sendto(data, (self.esp32_ip, int(self.esp32_port)))
         except Exception:
-            self.logger.warning("Lost connection to ESP32.")
-            if self.sock_writer:
-                self.sock_writer.close()
-            self.sock_writer = None
+            self.logger.warning("UDP send failed; will rediscover.")
+            if self.udp_sock:
+                try:
+                    self.udp_sock.close()
+                except Exception:
+                    pass
+            self.udp_sock = None
 
     async def listen_for_esp32(self, timeout=10):
         """Wait for UDP broadcast: SYSMN_INFO <ip> <port>"""
